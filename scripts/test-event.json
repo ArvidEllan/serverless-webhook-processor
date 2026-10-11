@@ -1,0 +1,20 @@
+{
+  "httpMethod": "POST",
+  "path": "/webhooks/demo-tenant",
+  "pathParameters": {
+    "tenantId": "demo-tenant"
+  },
+  "headers": {
+    "Content-Type": "application/json",
+    "x-webhook-signature": "sha256=REPLACE_WITH_GENERATED_SIGNATURE",
+    "x-tenant-id": "demo-tenant",
+    "User-Agent": "WebhookTestClient/1.0"
+  },
+  "requestContext": {
+    "requestId": "test-request-001",
+    "identity": {
+      "sourceIp": "127.0.0.1"
+    }
+  },
+  "body": "{\"event_type\":\"payment.completed\",\"tenant_id\":\"demo-tenant\",\"source\":\"payment-gateway\",\"data\":{\"transaction_id\":\"txn_abc123\",\"amount\":1500,\"currency\":\"KES\",\"merchant\":\"Test Merchant\"},\"metadata\":{\"environment\":\"test\"}}"
+}

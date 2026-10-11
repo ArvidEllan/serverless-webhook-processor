@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Secure Serverless Webhook Processor
+  Demonstrates: HMAC auth, KMS encryption, DynamoDB single-table,
+  rate limiting, tenant isolation, least-privilege IAM
+
+# ============================================================
+# GLOBALS — shared config across all functions
+# ============================================================
+Globals:
+  Function:
+    Timeout: 15
+    MemorySize: 256           # Go is memory-efficient; 256MB is plenty
+    Runtime: provided.al2023  # Custom runtime for Go (Amazon Linux 2023)
+    Architectures:
+      - arm64                 # Graviton: 20% cheaper, 10-15% faster for Go
+    Tracing: Active           # X-Ray tracing enabled
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref WebhookEventsTable
+        KMS_KEY_ID: !GetAtt WebhookEncryptionKey.Arn
+        WEBHOOK_SECRET_NAME: !Ref WebhookSecrets
+        RATE_LIMIT_PER_MINUTE: "100"
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  RetentionDays:
+    Type: Number
+    Default: 90
+    Description: Days to retain webhook events before TTL expiration
+
+# ============================================================
+# RESOURCES
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # API Gateway — entry point with throttling + WAF-ready
+  # ----------------------------------------------------------
+  WebhookApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref StageName
+      TracingEnabled: true
+      # API-level throttling (global backstop)
+      MethodSettings:
+        - HttpMethod: "*"
+          ResourcePath: "/*"
+          ThrottlingBurstLimit: 200
+          ThrottlingRateLimit: 100
+      # Access logging
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId",
+           "ip":"$context.identity.sourceIp",
+           "requestTime":"$context.requestTime",
+           "httpMethod":"$context.httpMethod",
+           "path":"$context.path",
+           "status":"$context.status",
+           "responseLength":"$context.responseLength",
+           "latency":"$context.integrationLatency"}
+
+  # ----------------------------------------------------------
+  # Lambda Function — webhook processor
+  # ----------------------------------------------------------
+  WebhookProcessorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      CodeUri: ../
+      Handler: bootstrap    # Go binary name for provided.al2023
+      Description: Processes incoming webhook events with security pipeline
+      # Reserved concurrency prevents runaway scaling + cost control
+      ReservedConcurrentExecutions: 100
+      Events:
+        WebhookEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WebhookApi
+            Path: /webhooks/{tenantId}
+            Method: POST
+      Policies:
+        # LEAST PRIVILEGE — only the permissions this function needs
+        - Version: "2012-10-17"
+          Statement:
+            # DynamoDB: read/write to specific table only
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+              Resource:
+                - !GetAtt WebhookEventsTable.Arn
+                - !Sub "${WebhookEventsTable.Arn}/index/*"
+            # KMS: encrypt/decrypt with specific key only
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource:
+                - !GetAtt WebhookEncryptionKey.Arn
+            # Secrets Manager: read specific secret only
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Ref WebhookSecrets
+            # X-Ray: write traces
+            - Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+              Resource: "*"
+
+  # ----------------------------------------------------------
+  # DynamoDB — single-table design with GSI
+  # ----------------------------------------------------------
+  WebhookEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "webhook-events-${StageName}"
+      BillingMode: PAY_PER_REQUEST  # Auto-scales; no capacity planning
+      # Encryption at rest with AWS-managed key (free)
+      SSESpecification:
+        SSEEnabled: true
+      # TTL for automatic event expiration
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      # Point-in-time recovery for disaster recovery
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      # Key schema
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      # GSI for tenant-based queries
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1-TenantIndex
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ----------------------------------------------------------
+  # KMS — customer-managed key for field-level encryption
+  # ----------------------------------------------------------
+  WebhookEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts webhook payload data at field level
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccountFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      EnableKeyRotation: true  # Automatic annual rotation
+
+  WebhookEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/webhook-encryption-${StageName}"
+      TargetKeyId: !Ref WebhookEncryptionKey
+
+  # ----------------------------------------------------------
+  # Secrets Manager — webhook signing secrets per tenant
+  # ----------------------------------------------------------
+  WebhookSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "webhook-secrets-${StageName}"
+      Description: HMAC signing secrets for webhook signature verification
+      SecretString: '{"demo-tenant": "replace-with-secure-random-secret"}'
+
+  # ----------------------------------------------------------
+  # CloudWatch — structured logging + dashboards
+  # ----------------------------------------------------------
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${WebhookProcessorFunction}"
+      RetentionInDays: 30
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/webhook-api-${StageName}"
+      RetentionInDays: 30
+
+  # ----------------------------------------------------------
+  # CloudWatch Alarms — operational awareness
+  # ----------------------------------------------------------
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "webhook-processor-errors-${StageName}"
+      AlarmDescription: Fires when Lambda error rate exceeds 5%
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WebhookProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "webhook-processor-throttles-${StageName}"
+      AlarmDescription: Fires when Lambda is being throttled
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WebhookProcessorFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+Outputs:
+  ApiEndpoint:
+    Description: Webhook API endpoint URL
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/webhooks/{tenantId}"
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt WebhookProcessorFunction.Arn
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref WebhookEventsTable
+  KmsKeyArn:
+    Description: KMS encryption key ARN
+    Value: !GetAtt WebhookEncryptionKey.Arn
